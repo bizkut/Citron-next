@@ -1,0 +1,237 @@
+kind: pipeline
+type: docker
+name: automated-linux-build
+
+steps:
+  # Step 1: Linux Build
+  - name: build-linux
+    image: ubuntu:latest
+    volumes:
+      - name: build-output
+        path: /drone/src/output
+    commands:
+      - set -e
+      - export DEBIAN_FRONTEND=noninteractive
+      - |
+          apt-get update && apt-get install -y \
+            build-essential \
+            cmake \
+            fuse \
+            libfuse2 \
+            g++-11 \
+            gcc-11 \
+            ninja-build \
+            git \
+            wget \
+            curl \
+            zip \
+            unzip \
+            tar \
+            imagemagick \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            glslang-tools \
+            libasound2-dev \
+            libglu1-mesa-dev \
+            libhidapi-dev \
+            libpulse-dev \
+            libudev-dev \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-render-util0 \
+            libxcb-xinerama0 \
+            libxcb-xkb1 \
+            libxext-dev \
+            libxkbcommon-x11-0 \
+            mesa-common-dev \
+            nasm \
+            qtbase5-dev \
+            qtbase5-private-dev \
+            qtwebengine5-dev \
+            qtmultimedia5-dev \
+            libmbedtls-dev \
+            libfmt-dev \
+            liblz4-dev \
+            nlohmann-json3-dev \
+            libzstd-dev \
+            libssl-dev \
+            libavfilter-dev \
+            libavcodec-dev \
+            libswscale-dev \
+            libboost-context-dev \
+            libsdl2-dev
+      # Clone Citron
+      - git clone --recursive https://git.citron-emu.org/Citron/citron.git
+      - cd citron
+      # Initialize and configure vcpkg
+      - ./externals/vcpkg/bootstrap-vcpkg.sh
+      - ./externals/vcpkg/vcpkg install
+      # Configure and build Citron
+      - mkdir build && cd build
+      - cmake .. -GNinja -DCMAKE_TOOLCHAIN_FILE=../externals/vcpkg/scripts/buildsystems/vcpkg.cmake -DCITRON_USE_BUNDLED_VCPKG=ON -DCITRON_TESTS=OFF -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 -DCITRON_USE_EXTERNAL_SDL2=OFF
+      - ninja
+
+      # Package binary and dependencies
+      - mkdir -p /drone/src/output/citron-linux
+      - cp bin/citron /drone/src/output/citron-linux/
+      - cp ./*.so* /drone/src/output/citron-linux/ || true
+
+      # Copy dependencies with version-agnostic symlinks
+      - |
+        for lib in libavcodec.so.* libavfilter.so.* libavformat.so.* \
+                  libavutil.so.* libswresample.so.* libswscale.so.* \
+                  libQt5Core.so.5 libQt5Gui.so.5 libQt5Widgets.so.5 \
+                  libQt5WebEngine.so.5 libQt5WebEngineCore.so.5 \
+                  libQt5WebEngineWidgets.so.5 libQt5Multimedia.so.5 \
+                  libQt5Network.so.5 libQt5Positioning.so.5 \
+                  libQt5PrintSupport.so.5 libQt5Qml.so.5 \
+                  libQt5Quick.so.5 libQt5QuickWidgets.so.5 \
+                  libQt5WebChannel.so.5 libQt5DBus.so.5 \
+                  libicui18n.so.* libicuuc.so.* libicudata.so.* \
+                  libxcb.so.* libX11.so.* libXext.so.* \
+                  libglib-2.0.so.* libSDL2-2.0.so.* \
+                  libpulse.so.* libasound.so.* \
+                  libhidapi-hidraw.so.* libudev.so.* \
+                  libjxl.so.* libjxl_threads.so.* \
+                  librav1e.so.* libSvtAv1Enc.so.* \
+                  libx265.so.* libpostproc.so.* \
+                  libplacebo.so.* libpulsecommon-*.so; do
+          find /usr/lib/x86_64-linux-gnu -name "$lib" -type f -exec cp -P {} /drone/src/output/citron-linux/ \;
+          find /usr/lib/x86_64-linux-gnu -name "$lib" -type l -exec cp -P {} /drone/src/output/citron-linux/ \;
+        done
+
+      # Copy Qt platform plugins
+      - mkdir -p /drone/src/output/citron-linux/platforms
+      - cp /usr/lib/x86_64-linux-gnu/qt5/plugins/platforms/libqxcb.so /drone/src/output/citron-linux/platforms/ || true
+
+      # Create AppImage structure
+      - mkdir -p AppDir/usr/bin AppDir/usr/lib AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+      - cp bin/citron AppDir/usr/bin/
+      - cp -r /drone/src/output/citron-linux/*.so* AppDir/usr/lib/
+      - cp -r /drone/src/output/citron-linux/platforms AppDir/usr/lib/
+
+      # Create a proper icon in the root AppDir (this is where appimagetool looks for it)
+      - convert -size 256x256 xc:orange -fill white -gravity center -draw "text 0,0 'C'" AppDir/citron.png
+
+      # Also copy the icon to the standard location
+      - cp AppDir/citron.png AppDir/usr/share/icons/hicolor/256x256/apps/
+
+      # Create AppRun script
+      - |
+        echo '#!/bin/bash
+        HERE=$(dirname $(readlink -f "$0"))
+        export LD_LIBRARY_PATH="$HERE/usr/lib:$LD_LIBRARY_PATH"
+        export QT_PLUGIN_PATH="$HERE/usr/lib"
+        exec "$HERE/usr/bin/citron" "$@"' > AppDir/AppRun
+      - chmod +x AppDir/AppRun
+
+      # Create desktop entry
+      - |
+        echo '[Desktop Entry]
+        Name=Citron
+        Exec=AppRun
+        Icon=citron
+        Type=Application
+        Categories=Game;Emulator;' > AppDir/citron.desktop
+
+      # Create a placeholder icon
+      - convert -size 256x256 xc:transparent AppDir/usr/share/icons/hicolor/256x256/apps/citron.png
+
+      # Validate AppDir contents
+      - ls -R AppDir
+
+      # Create AppImage using AppImageTool
+      - wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+      - chmod +x appimagetool-x86_64.AppImage
+      # Extract AppImageTool without using FUSE
+      - ./appimagetool-x86_64.AppImage --appimage-extract
+      # Use extracted AppImageTool
+      - ARCH=x86_64 ./squashfs-root/AppRun AppDir /drone/src/output/Citron-x86_64.AppImage
+
+      # Create launch script for tarball
+      - |
+        echo '#!/bin/bash
+        HERE="$(dirname "$(readlink -f "${0}")")"
+        export LD_LIBRARY_PATH="$HERE:$LD_LIBRARY_PATH"
+        export QT_PLUGIN_PATH="$HERE"
+        exec "$HERE/citron" "$@"' > /drone/src/output/citron-linux/launch.sh
+      - chmod +x /drone/src/output/citron-linux/launch.sh
+
+      # Create tarball
+      - cd /drone/src/output && tar -czf citron-linux.tar.gz citron-linux/
+
+  # Step 2: Publish Release
+  - name: publish-release
+    image: alpine:latest
+    volumes:
+      - name: build-output
+        path: /drone/src/output
+    commands:
+      - apk add --no-cache curl jq
+      - echo "Files available for publishing:"
+      - ls -la /drone/src/output/
+      - |
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        if [ -z "$FORGEJO_TOKEN" ]; then
+          echo "Error: FORGEJO_TOKEN is not set"
+          exit 1
+        fi
+
+        # Create the release
+        RELEASE_RESPONSE=$(curl -s -X POST \
+          -H "Authorization: token $FORGEJO_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"tag_name\": \"nightly-$TIMESTAMP\",
+            \"name\": \"Nightly Build $TIMESTAMP\",
+            \"body\": \"Automated builds from commit ${DRONE_COMMIT_SHA:0:8}\",
+            \"prerelease\": true,
+            \"target_commitish\": \"$DRONE_COMMIT_SHA\"
+          }" \
+          "https://git.citron-emu.org/api/v1/repos/Citron/citron/releases")
+
+        # Check if release was created successfully
+        echo "Release creation response: $RELEASE_RESPONSE"
+        RELEASE_ID=$(echo "$RELEASE_RESPONSE" | jq .id)
+
+        if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+          echo "Failed to get release ID"
+          exit 1
+        fi
+
+        # Upload the binary package
+        echo "Uploading binary package to release $RELEASE_ID"
+        curl -X POST \
+          -H "Authorization: token $FORGEJO_TOKEN" \
+          -H "Content-Type: application/gzip" \
+          --data-binary @/drone/src/output/citron-linux.tar.gz \
+          "https://git.citron-emu.org/api/v1/repos/Citron/citron/releases/$RELEASE_ID/assets?name=citron-linux.tar.gz"
+
+        # Upload the AppImage
+        echo "Uploading AppImage to release $RELEASE_ID"
+        curl -X POST \
+          -H "Authorization: token $FORGEJO_TOKEN" \
+          -H "Content-Type: application/x-executable" \
+          --data-binary @/drone/src/output/Citron-x86_64.AppImage \
+          "https://git.citron-emu.org/api/v1/repos/Citron/citron/releases/$RELEASE_ID/assets?name=Citron-x86_64.AppImage"
+    environment:
+      FORGEJO_TOKEN:
+        from_secret: forgejo_token
+    when:
+      event:
+        - push
+        - tag
+
+volumes:
+  - name: build-output
+    temp: {}
+
+trigger:
+  event:
+    - push
+    - tag
+  branch:
+    - main
